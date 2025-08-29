@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Arbitraggio – 1X2 / OverUnder</title>
+<style>
+body{font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial; padding:12px; max-width:960px;margin:auto;}
+input,select,button{font-size:15px;padding:8px;margin:6px 0;width:100%;box-sizing:border-box;}
+.row{display:grid;grid-template-columns:1fr;gap:8px;}
+@media(min-width:720px){.row{grid-template-columns:1fr 1fr 1fr 1fr;}}
+table{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px;}
+th,td{border:1px solid #ddd;padding:8px;text-align:center;}
+th{background:#f7f7f7;position:sticky;top:56px;}
+.badge{padding:4px 8px;border-radius:10px;color:#fff;font-weight:700;}
+.g{background:#28a745}.y{background:#ffc107;color:#000}.o{background:#fd7e14}
+.muted{color:#6b7280;font-size:13px}
+.err{background:#fff3cd;border:1px solid #ffeeba;padding:8px;border-radius:6px;margin-top:8px;}
+.small{font-size:13px;color:#444}
+</style>
+</head>
+<body>
+<h2>Arbitraggio — 1X2 · Over/Under 2.5</h2>
+
+<div class="row">
+  <input id="apiKey" placeholder="API Key The Odds API (lascia vuoto per demo)">
+  <select id="sport">
+    <option value="soccer_italy_serie_a">Soccer — Serie A (Italy)</option>
+    <option value="soccer_eng_premier_league">Soccer — Premier League</option>
+    <option value="soccer_spain_la_liga">Soccer — La Liga (Spain)</option>
+    <option value="soccer_world">Soccer — World (all)</option>
+  </select>
+  <input id="totalStake" type="number" value="100" step="1" />
+  <button id="btnFetch">Aggiorna quote / Usa demo</button>
+</div>
+
+<div class="row">
+  <label><input type="checkbox" id="mkt1x2" checked> Mostra 1X2</label>
+  <label><input type="checkbox" id="mkttotals" checked> Mostra Over/Under 2.5</label>
+  <!-- BTTS rimosso -->
+  <label>Regioni API (EU/UK/US): <input id="regions" value="eu,uk" /></label>
+</div>
+
+<div class="row">
+  <label>Mostra solo margine minimo (%)</label>
+  <input id="minMargin" type="number" value="0.5" step="0.1" />
+  <label>Auto-refresh (minuti, 0 = off)</label>
+  <input id="refreshMin" type="number" value="5" step="1" />
+</div>
+
+<div id="error" class="err" style="display:none"></div>
+
+<div style="overflow:auto">
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>Data/ora</th><th>Evento</th><th>Mercato</th>
+        <th>Esito A</th><th>Esito B</th><th>Esito C</th>
+        <th>Stake A</th><th>Stake B</th><th>Stake C</th>
+        <th>Payout min</th><th>Profitto</th><th>Margine</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<p class="muted small">
+Nota: il tool usa quote “punta” (back). Se non inserisci API Key vedrai dati demo. Se fetch API fallisce per CORS, usa app preview (Koder).
+</p>
+
+<script>
+const el = id => document.getElementById(id);
+const tbody = document.querySelector("#tbl tbody");
+const errBox = el("error");
+let timer = null;
+
+function setError(msg){
+  if(!msg){ errBox.style.display="none"; errBox.textContent=""; return; }
+  errBox.style.display="block"; errBox.textContent = msg;
+}
+
+function round2(x){ return Math.round(x*100)/100; }
+function nowNice(iso){ try{ return new Date(iso).toLocaleString(); }catch(e){ return iso; } }
+
+function bestOddsForH2H(bookmakers, home, away){
+  let best={home:{odd:0,book:""},draw:{odd:0,book:""},away:{odd:0,book:""}};
+  (bookmakers||[]).forEach(b=>{
+    const m = (b.markets||[]).find(mm=>mm.key==="h2h"||mm.key==="1x2"||mm.key==="h2h_full_time");
+    if(!m) return;
+    (m.outcomes||[]).forEach(o=>{
+      const name = (o.name||"").toLowerCase();
+      const price = parseFloat(o.price);
+      if(!price||price<=1) return;
+      if(name.includes("draw")||name.includes("pareggio")) {
+        if(price>best.draw.odd) best.draw={odd:price,book:b.title||b.key};
+      } else if(name.includes((home||"").toLowerCase())) {
+        if(price>best.home.odd) best.home={odd:price,book:b.title||b.key};
+      } else if(name.includes((away||"").toLowerCase())) {
+        if(price>best.away.odd) best.away={odd:price,book:b.title||b.key};
+      }
+    });
+  });
+  if(best.home.odd && best.draw.odd && best.away.odd) return best;
+  return null;
+}
+
+function bestOddsForTotals(bookmakers, tgtGoal="2.5"){
+  let best = {over:{odd:0,book:""}, under:{odd:0,book:""}};
+  (bookmakers||[]).forEach(b=>{
+    const m = (b.markets||[]).find(mm=>mm.key==="totals"||mm.key==="total");
+    if(!m) return;
+    (m.outcomes||[]).forEach(o=>{
+      const name = (o.name||"").toLowerCase();
+      const price = parseFloat(o.price);
+      if(!price||price<=1) return;
+      if(name.includes("over") && name.includes(tgtGoal)){
+        if(price>best.over.odd) best.over={odd:price,book:b.title||b.key};
+      } else if(name.includes("under") && name.includes(tgtGoal)){
+        if(price>best.under.odd) best.under={odd:price,book:b.title||b.key};
+      }
+    });
+  });
+  if(best.over.odd && best.under.odd) return best;
+  return null;
+}
+
+function calcTwoWay(total, oddA, oddB){
+  const invA = 1/oddA, invB = 1/oddB;
+  const sum = invA + invB;
+  const margin = (1/sum) - 1;
+  const stakeA = total * (invA / sum);
+  const stakeB = total * (invB / sum);
+  const payoutA = stakeA * oddA;
+  const payoutB = stakeB * oddB;
+  const payoutMin = Math.min(payoutA, payoutB);
+  const profit = payoutMin - total;
+  return {stakeA, stakeB, payoutMin, profit, margin};
+}
+
+function calcThreeWay(total, odd1, oddX, odd2){
+  const inv1 = 1/odd1, invX = 1/oddX, inv2 = 1/odd2;
+  const sum = inv1 + invX + inv2;
+  const margin = (1/sum) - 1;
+  const s1 = total * (inv1 / sum);
+  const sX = total * (invX / sum);
+  const s2 = total * (inv2 / sum);
+  const p1 = s1 * odd1, pX = sX * oddX, p2 = s2 * odd2;
+  const payoutMin = Math.min(p1,pX,p2);
+  const profit = payoutMin - total;
+  return {s1,sX,s2,payoutMin,profit,margin};
+}
+
+function addRow(time, eventName, market, aTxt, bTxt, cTxt, stakeA, stakeB, stakeC, payoutMin, profit, margin){
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td>${nowNice(time)}</td>
+    <td>${eventName}</td>
+    <td>${market}</td>
+    <td>${aTxt||""}</td>
+    <td>${bTxt||""}</td>
+    <td>${cTxt||""}</td>
+    <td>${stakeA!==null?round2(stakeA)+"€":""}</td>
+    <td>${stakeB!==null?round2(stakeB)+"€":""}</td>
+    <td>${stakeC!==null?round2(stakeC)+"€":""}</td>
+    <td>${round2(payoutMin)}€</td>
+    <td>${round2(profit)}€</td>
+    <td><span class="badge ${margin>=0.015?'g':margin>=0.005?'y':'o'}">${(margin*100).toFixed(2)}%</span></td>`;
+  tbody.appendChild(tr);
+}
+
+function demoEvents(){
+  return [
+    {
+      commence_time: new Date(Date.now()+3600*1000).toISOString(),
+      home_team:"Cremonese", away_team:"Sassuolo",
+      bookmakers:[
+        {title:"DemoA", markets:[{key:"h2h", outcomes:[{name:"Cremonese", price:2.44},{name:"Draw", price:3.58},{name:"Sassuolo", price:3.35}]}]},
+        {title:"DemoB", markets:[{key:"totals", outcomes:[{name:"Over 2.5", price:2.10},{name:"Under 2.5", price:1.75}]}]}
+      ]
+    },
+    {
+      commence_time: new Date(Date.now()+7200*1000).toISOString(),
+      home_team:"Juventus", away_team:"Milan",
+      bookmakers:[
+        {title:"DemoX", markets:[{key:"h2h", outcomes:[{name:"Juventus", price:1.90},{name:"Draw", price:3.20},{name:"Milan", price:4.00}]}]},
+        {title:"DemoY", markets:[{key:"totals", outcomes:[{name:"Over 2.5", price:1.85},{name:"Under 2.5", price:2.05}]}]}
+      ]
+    }
+  ];
+}
+
+async function fetchLiveOdds(){
+  const key = (el("apiKey").value||"").trim();
+  if(!key) throw new Error("No API key");
+  const sport = el("sport").value;
+  const regions = (el("regions").value||"eu,uk");
+  const markets = ["h2h","totals"];
+  const url = `https://api.the-odds-api.com/v4/sports/${encodeURIComponent(sport)}/odds/?regions=${encodeURIComponent(regions)}&markets=${encodeURIComponent(markets.join(","))}&oddsFormat=decimal&apiKey=${encodeURIComponent(key)}`;
+  const res = await fetch(url,{cache:"no-store"});
+  if(!res.ok){
+    let txt = `HTTP ${res.status}`;
+    try{ const j = await res.json(); if(j && j.message) txt += " - "+j.message; } catch(e){}
+    throw new Error(txt);
+  }
+  const data = await res.json();
+  return data;
+}
+
+async function fetchAndShow(){
+  setError("");
+  tbody.innerHTML = '<tr><td colspan="12" class="muted">Caricamento...</td></tr>';
+  try{
+    let events;
+    if(el("apiKey").value.trim()){
+      try{
+        const live = await fetchLiveOdds();
+        events = (live||[]).map(e=>({
+          commence_time: e.commence_time,
+          home_team: e.home_team,
+          away_team: e.away_team,
+          bookmakers: e.bookmakers
+        }));
+        if(!events.length) { setError("Nessun evento ricevuto dall'API, mostro demo."); events = demoEvents(); }
+      } catch(apiErr){
+        setError("Errore API: " + (apiErr.message||apiErr)); 
+        events = demoEvents();
+      }
+    } else {
+      setError("API Key non inserita — stai vedendo dati demo.");
+      events = demoEvents();
+    }
+
+    tbody.innerHTML = "";
+    const total = parseFloat(el("totalStake").value||"0") || 0;
+    const show1x2 = el("mkt1x2").checked;
+    const showTot = el("mkttotals").checked;
+    const minMargin = (parseFloat(el("minMargin").value||"0")||0)/100;
+
+    events.forEach(ev=>{
+      const evName = `${ev.home_team} – ${ev.away_team}`;
+      // 1X2
+      if(show1x2){
+        const h2h = bestOddsForH2H(ev.bookmakers, ev.home_team, ev.away_team);
+        if(h2h){
+          const calc = calcThreeWay(total, h2h.home.odd, h2h.draw.odd, h2h.away.odd);
+          if(calc.margin >= minMargin){
+            addRow(ev.commence_time, evName, "1X2", 
+              `${ev.home_team} ${h2h.home.odd.toFixed(2)} (${h2h.home.book})`,
+              `X ${h2h.draw.odd.toFixed(2)} (${h2h.draw.book})`,
+              `${ev.away_team} ${h2h.away.odd.toFixed(2)} (${h2h.away.book})`,
+              calc.s1, calc.sX, calc.s2, calc.payoutMin, calc.profit, calc.margin);
+          }
+        }
+      }
+      // totals 2.5
+      if(showTot){
+        const t = bestOddsForTotals(ev.bookmakers,"2.5");
+        if(t){
+          const c = calcTwoWay(total, t.over.odd, t.under.odd);
+          if(c.margin >= minMargin){
+            addRow(ev.commence_time, evName, "Over/Under 2.5", 
+              `Over 2.5 ${t.over.odd.toFixed(2)} (${t.over.book})`,
+              `Under 2.5 ${t.under.odd.toFixed(2)} (${t.under.book})`,
+              "", c.stakeA, c.stakeB, null, c.payoutMin, c.profit, c.margin);
+          }
+        }
+      }
+    });
+
+    if(!tbody.querySelector("tr")) {
+      tbody.innerHTML = `<tr><td colspan="12" class="muted">Nessun opportunità trovata (o filtri troppo restrittivi).</td></tr>`;
+    }
+  }catch(e){
+    setError("Errore imprevisto: " + (e && e.message ? e.message : e));
+    tbody.innerHTML = "";
+  }
+}
+
+el("btnFetch").addEventListener("click", ()=>{ fetchAndShow(); startAuto(); });
+el("refreshMin").addEventListener("change", startAuto);
+
+function startAuto(){
+  if(timer) { clearInterval(timer); timer=null; }
+  const m = parseInt(el("refreshMin").value||"0",10);
+  if(m>0) timer=setInterval(fetchAndShow, m*60*1000);
+}
+
+fetchAndShow();
+startAuto();
+</script>
+</body>
+</html>
